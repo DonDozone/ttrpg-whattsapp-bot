@@ -102,7 +102,8 @@ async function startBot(): Promise<void> {
     if (type !== 'notify') return
 
     const botPhone = (sock.user?.id ?? '').split(':')[0].split('@')[0]
-    console.log(`[DEBUG] bot-phone: "${botPhone}"`)
+    // Neuere WhatsApp-Versionen verwenden LIDs statt Telefonnummern in Mentions
+    const botLid = (sock.authState.creds.me?.lid ?? '').split(':')[0].split('@')[0]
 
     for (const msg of messages) {
       if (msg.key.fromMe) continue
@@ -112,17 +113,16 @@ async function startBot(): Promise<void> {
       if (GROUP_JID && jid !== GROUP_JID) continue
 
       const text = getMessageText(msg)
+      if (!text) continue
 
       const mentionedJids =
         msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ?? []
-      console.log(`[DEBUG] msgTypes: ${JSON.stringify(Object.keys(msg.message ?? {}))}`)
-      console.log(`[DEBUG] text: ${JSON.stringify(text)}`)
-      console.log(`[DEBUG] mentionedJids: ${JSON.stringify(mentionedJids)}`)
-
-      if (!text) continue
-
       const isMentioned =
-        botPhone !== '' && mentionedJids.some(j => j.startsWith(botPhone))
+        botPhone !== '' &&
+        mentionedJids.some(j => {
+          const num = j.split('@')[0]
+          return num === botPhone || (botLid !== '' && num === botLid)
+        })
 
       let question: string | null = null
 
