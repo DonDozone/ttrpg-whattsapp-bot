@@ -12,26 +12,51 @@ import dotenv from 'dotenv'
 dotenv.config()
 
 const QUERY_SERVICE_URL = process.env.QUERY_SERVICE_URL ?? 'http://localhost:3000'
-const GROUP_JID = process.env.GROUP_JID // optional: nur auf diese Gruppe reagieren
+const GROUP_JID = process.env.GROUP_JID
 
 const TRIGGER = '!lore '
 
 const logger = pino({ level: 'silent' })
 
+// Baileys loggt libsignal-Entschlüsselungsfehler direkt via console.error —
+// diese sind harmlos (alte Sessions anderer Geräte) und verstecken echte Fehler.
+const _origError = console.error
+console.error = (...args: unknown[]) => {
+  const msg = String(args[0] ?? '')
+  if (msg.includes('Bad MAC') || msg.includes('Failed to decrypt')) return
+  _origError(...args)
+}
+
 function getMessageText(msg: WAMessage): string | null {
   const m = msg.message
   if (!m) return null
-  return (
-    m.conversation ??
-    m.extendedTextMessage?.text ??
-    m.imageMessage?.caption ??
-    null
-  )
+  return m.conversation ?? m.extendedTextMessage?.text ?? m.imageMessage?.caption ?? null
+}
+
+function mdToWhatsApp(text: string): string {
+  return text
+    .replace(/\*\*(.+?)\*\*/gs, '*$1*')      // **fett** → *fett*
+    .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')    // # Überschrift → *Überschrift*
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // [text](url) → text
+}
+
+function formatSources(sources: unknown[]): string {
+  if (!sources.length) return ''
+  return sources
+    .map(s => {
+      if (typeof s === 'string') return `🔗 ${s}`
+      if (s !== null && typeof s === 'object') {
+        const o = s as Record<string, unknown>
+        return `🔗 ${String(o.url ?? o.href ?? o.link ?? JSON.stringify(s))}`
+      }
+      return `🔗 ${String(s)}`
+    })
+    .join('\n')
 }
 
 interface QueryResponse {
   text: string
-  sources: string[]
+  sources: unknown[]
 }
 
 async function queryWiki(question: string): Promise<string> {
@@ -41,29 +66,20 @@ async function queryWiki(question: string): Promise<string> {
     body: JSON.stringify({ question }),
   })
 
-  if (!res.ok) {
-    throw new Error(`Query-Service antwortet mit HTTP ${res.status}`)
-  }
+  if (!res.ok) throw new Error(`Query-Service antwortet mit HTTP ${res.status}`)
 
   const data = (await res.json()) as QueryResponse
-  let reply = data.text
+  const text = mdToWhatsApp(data.text)
+  const sourcesBlock = formatSources(data.sources)
 
-  if (data.sources.length > 0) {
-    reply += '\n\n🔗 ' + data.sources.join('\n🔗 ')
-  }
-
-  return reply
+  return sourcesBlock ? `${text}\n\n${sourcesBlock}` : text
 }
 
 async function startBot(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState('auth')
   const { version } = await fetchLatestBaileysVersion()
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger,
-  })
+  const sock = makeWASocket({ version, auth: state, logger })
 
   sock.ev.on('creds.update', saveCreds)
 
@@ -85,18 +101,31 @@ async function startBot(): Promise<void> {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return
 
+    const botPhone = (sock.user?.id ?? '').split(':')[0].split('@')[0]
+
     for (const msg of messages) {
       if (msg.key.fromMe) continue
 
       const jid = msg.key.remoteJid ?? ''
-      if (!jid.endsWith('@g.us')) continue // nur Gruppen-Chats
-      if (GROUP_JID && jid !== GROUP_JID) continue // optionaler Gruppen-Filter
+      if (!jid.endsWith('@g.us')) continue
+      if (GROUP_JID && jid !== GROUP_JID) continue
 
       const text = getMessageText(msg)
       if (!text) continue
-      if (!text.toLowerCase().startsWith(TRIGGER)) continue
 
-      const question = text.slice(TRIGGER.length).trim()
+      const mentionedJids =
+        msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ?? []
+      const isMentioned =
+        botPhone !== '' && mentionedJids.some(j => j.startsWith(botPhone))
+
+      let question: string | null = null
+
+      if (text.toLowerCase().startsWith(TRIGGER)) {
+        question = text.slice(TRIGGER.length).trim()
+      } else if (isMentioned) {
+        question = text.replace(/@\d+/g, '').trim()
+      }
+
       if (!question) continue
 
       console.log(`❓ [${jid}] ${question}`)
