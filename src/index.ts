@@ -6,6 +6,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys'
 import { Boom } from '@hapi/boom'
 import pino from 'pino'
+import qrcode from 'qrcode-terminal'
 import dotenv from 'dotenv'
 
 dotenv.config()
@@ -61,13 +62,16 @@ async function startBot(): Promise<void> {
   const sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: true,
     logger,
   })
 
   sock.ev.on('creds.update', saveCreds)
 
-  sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+  sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+    if (qr) {
+      qrcode.generate(qr, { small: true })
+      console.log('QR-Code erschienen — bitte mit der Prepaid-Nummer scannen')
+    }
     if (connection === 'close') {
       const code = (lastDisconnect?.error as Boom)?.output?.statusCode
       const shouldReconnect = code !== DisconnectReason.loggedOut
