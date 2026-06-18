@@ -1,0 +1,19 @@
+{
+  "name": "pathfinder-whatsapp",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "dotenv": "^16.4.5",
+    "pino": "^9.0.0",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}

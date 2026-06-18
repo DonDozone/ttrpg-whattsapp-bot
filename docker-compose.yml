@@ -1,0 +1,8 @@
+services:
+  whatsapp-bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./auth:/app/auth
+    network_mode: host
