@@ -109,8 +109,8 @@ async function startBot(): Promise<void> {
       if (msg.key.fromMe) continue
 
       const jid = msg.key.remoteJid ?? ''
-      if (!jid.endsWith('@g.us')) continue
-      if (GROUP_JID && jid !== GROUP_JID) continue
+      const isGroup = jid.endsWith('@g.us')
+      if (isGroup && GROUP_JID && jid !== GROUP_JID) continue
 
       const text = getMessageText(msg)
       if (!text) continue
