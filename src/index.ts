@@ -54,24 +54,36 @@ function formatSources(sources: unknown[]): string {
     .join('\n')
 }
 
-interface QueryResponse {
+interface AcknowledgeResponse {
+  text: string
+}
+
+interface ChatResponse {
   text: string
   sources: unknown[]
 }
 
-async function queryWiki(question: string): Promise<string> {
+async function fetchAcknowledge(question: string): Promise<string> {
+  const res = await fetch(`${QUERY_SERVICE_URL}/api/acknowledge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question }),
+  })
+  if (!res.ok) throw new Error(`Acknowledge-Endpoint antwortet mit HTTP ${res.status}`)
+  const data = (await res.json()) as AcknowledgeResponse
+  return data.text
+}
+
+async function fetchChat(question: string): Promise<string> {
   const res = await fetch(`${QUERY_SERVICE_URL}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question }),
   })
-
   if (!res.ok) throw new Error(`Query-Service antwortet mit HTTP ${res.status}`)
-
-  const data = (await res.json()) as QueryResponse
+  const data = (await res.json()) as ChatResponse
   const text = mdToWhatsApp(data.text)
   const sourcesBlock = formatSources(data.sources)
-
   return sourcesBlock ? `${text}\n\n${sourcesBlock}` : text
 }
 
@@ -136,10 +148,22 @@ async function startBot(): Promise<void> {
 
       console.log(`❓ [${jid}] ${question}`)
 
+      // Beide Calls parallel starten — Acknowledge kommt zuerst, Chat danach
+      const acknowledgePromise = fetchAcknowledge(question)
+      const chatPromise = fetchChat(question)
+
       try {
-        const reply = await queryWiki(question)
+        const ack = await acknowledgePromise
+        await sock.sendMessage(jid, { text: ack }, { quoted: msg })
+        console.log('⏳ Überbrückungsantwort gesendet')
+      } catch (err) {
+        console.error('Fehler beim Acknowledge-Endpoint:', err)
+      }
+
+      try {
+        const reply = await chatPromise
         await sock.sendMessage(jid, { text: reply }, { quoted: msg })
-        console.log('✅ Antwort gesendet')
+        console.log('✅ Vollantwort gesendet')
       } catch (err) {
         console.error('Fehler beim Query-Service:', err)
         await sock.sendMessage(
