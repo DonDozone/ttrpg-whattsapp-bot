@@ -148,23 +148,31 @@ async function startBot(): Promise<void> {
 
       console.log(`❓ [${jid}] ${question}`)
 
-      // Beide Calls parallel starten — Acknowledge kommt zuerst, Chat danach
+      // Beide Calls parallel starten
       const acknowledgePromise = fetchAcknowledge(question)
       const chatPromise = fetchChat(question)
 
-      try {
-        const ack = await acknowledgePromise
-        await sock.sendMessage(jid, { text: ack }, { quoted: msg })
-        console.log('⏳ Überbrückungsantwort gesendet')
-      } catch (err) {
-        console.error('Fehler beim Acknowledge-Endpoint:', err)
-      }
+      let chatSettled = false
+
+      // Acknowledge nur senden, wenn Chat noch nicht fertig ist
+      acknowledgePromise
+        .then(async ack => {
+          if (chatSettled) {
+            console.log('⏭️ Überbrückungsantwort verworfen (Antwort bereits fertig)')
+            return
+          }
+          await sock.sendMessage(jid, { text: ack }, { quoted: msg })
+          console.log('⏳ Überbrückungsantwort gesendet')
+        })
+        .catch(err => console.error('Fehler beim Acknowledge-Endpoint:', err))
 
       try {
         const reply = await chatPromise
+        chatSettled = true
         await sock.sendMessage(jid, { text: reply }, { quoted: msg })
         console.log('✅ Vollantwort gesendet')
       } catch (err) {
+        chatSettled = true
         console.error('Fehler beim Query-Service:', err)
         await sock.sendMessage(
           jid,
