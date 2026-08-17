@@ -8,6 +8,7 @@ import { Boom } from '@hapi/boom'
 import pino from 'pino'
 import qrcode from 'qrcode-terminal'
 import dotenv from 'dotenv'
+import { existsSync, writeFileSync, rmSync } from 'node:fs'
 
 dotenv.config()
 
@@ -19,6 +20,9 @@ const HEARTBEAT_URL = process.env.HEARTBEAT_URL
 const TRIGGER = '!wiki '
 const ALERT_COOLDOWN_MS = 15 * 60_000
 const HEARTBEAT_INTERVAL_MS = 5 * 60_000
+
+// Liegt im auth-Volume und überlebt damit Container-Neustarts.
+const ALERT_MARKER = 'auth/.alert-sent'
 
 // Disconnect-Codes, bei denen die Session tot ist und ein neuer QR-Scan ansteht.
 const FATAL_DISCONNECTS: Record<number, string> = {
@@ -54,7 +58,20 @@ async function alert(title: string, body: string): Promise<void> {
   // Baileys wiederholt QR- und Disconnect-Events im Sekundentakt; ohne Cooldown
   // würde daraus eine Benachrichtigungslawine.
   if (Date.now() - lastAlertAt < ALERT_COOLDOWN_MS) return
+  // Der Cooldown im Speicher überlebt aber keinen Prozessneustart. Deshalb
+  // zusätzlich ein Marker auf der Platte: eine Störung, eine Meldung — egal wie
+  // oft der Container dazwischen neu startet. Zurückgesetzt wird er erst,
+  // wenn die Verbindung wieder steht.
+  if (existsSync(ALERT_MARKER)) return
+
   lastAlertAt = Date.now()
+  try {
+    writeFileSync(ALERT_MARKER, `${new Date().toISOString()} ${title}\n`)
+  } catch (err) {
+    // Ohne Marker gibt es wieder Wiederholungen — das ist laut, aber besser
+    // als gar keine Meldung, also wird trotzdem gesendet.
+    _origError('Alarm-Marker nicht schreibbar:', err)
+  }
 
   try {
     await fetch(NOTIFY_URL, {
@@ -65,6 +82,26 @@ async function alert(title: string, body: string): Promise<void> {
   } catch (err) {
     _origError('Benachrichtigung fehlgeschlagen:', err)
   }
+}
+
+function clearAlertMarker(): void {
+  try {
+    rmSync(ALERT_MARKER, { force: true })
+  } catch (err) {
+    _origError('Alarm-Marker nicht löschbar:', err)
+  }
+}
+
+// Ohne Reconnect hat Node nichts mehr zu tun und beendet sich mit Code 0 —
+// woraufhin Docker (`restart: unless-stopped`) den Container neu startet, der
+// sofort wieder dasselbe 401 kassiert. Der Prozess bleibt deshalb absichtlich
+// am Leben, bis jemand die Session manuell neu verknüpft.
+function park(): void {
+  console.log(
+    'Kein Reconnect möglich — Prozess wartet auf manuellen Eingriff ' +
+      '(auth/ leeren, Container neu starten, QR scannen).',
+  )
+  setInterval(() => {}, HEARTBEAT_INTERVAL_MS)
 }
 
 let heartbeatTimer: NodeJS.Timeout | null = null
@@ -188,8 +225,10 @@ async function startBot(): Promise<void> {
       }
 
       if (shouldReconnect) startBot()
+      else park()
     } else if (connection === 'open') {
       console.log('✅ WhatsApp-Bot verbunden')
+      clearAlertMarker()
       startHeartbeat()
     }
   })

@@ -44,10 +44,10 @@ All logic lives in `src/index.ts`. There are no other source files.
 8. `formatSources()` renders source URLs as `🔗 <url>` lines appended to the reply.
 9. Both replies are sent quoted to the original message.
 
-**Reconnection:** `connection.update` handler calls `startBot()` recursively on disconnect unless the disconnect reason is `loggedOut`.
+**Reconnection:** `connection.update` handler calls `startBot()` recursively on disconnect unless the disconnect reason is `loggedOut` — in that case `park()` keeps the process alive instead. Without it Node would exit 0 (nothing left in the event loop), Docker's `restart: unless-stopped` would restart the container, and it would hit the same 401 within seconds — a restart loop that also re-fires the alert on every pass. Recovery from `park()` is manual: clear `auth/`, restart, rescan the QR code.
 
 **Auth monitoring:** Losing the WhatsApp session is silent by default — the process keeps running, so Docker's `restart: unless-stopped` never fires. Two independent layers cover this:
-1. *Event-based* (`alert()`): fires on fatal disconnect codes (`FATAL_DISCONNECTS`) **and** on a `qr` event when `creds.registered` was already true — the latter catches every form of invalid auth, since all of them end in Baileys requesting a new QR. Alerts are debounced by `ALERT_COOLDOWN_MS` (15 min) because Baileys repeats these events every few seconds.
+1. *Event-based* (`alert()`): fires on fatal disconnect codes (`FATAL_DISCONNECTS`) **and** on a `qr` event when `creds.registered` was already true — the latter catches every form of invalid auth, since all of them end in Baileys requesting a new QR. Two-stage deduplication, because one outage must produce exactly one push: `ALERT_COOLDOWN_MS` (15 min, in memory) absorbs the event bursts Baileys emits every few seconds, and the `ALERT_MARKER` file (`auth/.alert-sent`, inside the mounted volume) survives process restarts. The marker is only removed once `connection === 'open'` again, so a persistent outage stays at one notification no matter how often the container cycles. Safe to keep in `auth/`: `useMultiFileAuthState` only ever reads fixed filenames, it never enumerates the directory.
 2. *Dead-man's switch* (`startHeartbeat()`): pings `HEARTBEAT_URL` every 5 min, but only while `connection === 'open'`; stopped on `close`. Covers what no event can report — container OOM, hung process, droplet reboot.
 
 Notifications deliberately do **not** go through WhatsApp, since that channel is the one that's broken when they matter.
