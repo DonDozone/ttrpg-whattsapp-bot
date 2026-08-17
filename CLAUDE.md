@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is the **WhatsApp adapter** (`pathfinder-whatsapp`) for a Pathfinder 2e TTRPG group's lore wiki. It listens to a WhatsApp group and forwards `!wiki`-triggered or @mention queries to the **Query-Service** (`pathfinder-chat`, runs separately on the server), then sends the response back to the group.
 
-The architecture is deliberately thin: this bot holds **no Anthropic API key** and contains no retrieval logic. It is purely a transport layer between WhatsApp and the Query-Service at `QUERY_SERVICE_URL/api/chat`.
+The architecture is deliberately thin: this bot holds **no Anthropic API key** and contains no retrieval logic. It is purely a transport layer between WhatsApp and the Query-Service at `QUERY_SERVICE_URL/api/acknowledge` + `/api/chat`.
 
 Sister services on the DigitalOcean droplet (`ubuntu-s-foundry`):
 - **Query-Service** → `/opt/pnp-wiki/query-service/` (Hono HTTP server, Tool-Use-based retrieval, Claude via `@anthropic-ai/sdk`)
@@ -37,10 +37,12 @@ All logic lives in `src/index.ts`. There are no other source files.
 1. Baileys receives `messages.upsert` events.
 2. Filter: only `type === 'notify'`, only group messages (`@g.us`), optionally only the configured `GROUP_JID`.
 3. Trigger detection: `!wiki <question>` (prefix) **or** @mention of the bot (by phone number or LID — newer WhatsApp versions use LIDs instead of phone numbers in mention lists).
-4. `queryWiki()` calls `POST QUERY_SERVICE_URL/api/chat` with `{ question }`, returns `{ text, sources[] }`.
-5. `mdToWhatsApp()` converts Markdown to WhatsApp formatting (bold, headings → `*…*`; strips link syntax).
-6. `formatSources()` renders source URLs as `🔗 <url>` lines appended to the reply.
-7. Reply is sent quoted to the original message.
+4. Both API calls start in parallel (`fetchAcknowledge` + `fetchChat`).
+5. `fetchAcknowledge()` resolves first → short bridging text sent immediately as first WhatsApp message.
+6. `fetchChat()` resolves later (~5–30 s) → full answer with sources sent as second message.
+7. `mdToWhatsApp()` converts Markdown to WhatsApp formatting (bold, headings → `*…*`; strips link syntax).
+8. `formatSources()` renders source URLs as `🔗 <url>` lines appended to the reply.
+9. Both replies are sent quoted to the original message.
 
 **Reconnection:** `connection.update` handler calls `startBot()` recursively on disconnect unless the disconnect reason is `loggedOut`.
 
