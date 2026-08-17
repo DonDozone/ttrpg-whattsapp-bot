@@ -44,6 +44,12 @@ All logic lives in `src/index.ts`. There are no other source files.
 
 **Reconnection:** `connection.update` handler calls `startBot()` recursively on disconnect unless the disconnect reason is `loggedOut`.
 
+**Auth monitoring:** Losing the WhatsApp session is silent by default — the process keeps running, so Docker's `restart: unless-stopped` never fires. Two independent layers cover this:
+1. *Event-based* (`alert()`): fires on fatal disconnect codes (`FATAL_DISCONNECTS`) **and** on a `qr` event when `creds.registered` was already true — the latter catches every form of invalid auth, since all of them end in Baileys requesting a new QR. Alerts are debounced by `ALERT_COOLDOWN_MS` (15 min) because Baileys repeats these events every few seconds.
+2. *Dead-man's switch* (`startHeartbeat()`): pings `HEARTBEAT_URL` every 5 min, but only while `connection === 'open'`; stopped on `close`. Covers what no event can report — container OOM, hung process, droplet reboot.
+
+Notifications deliberately do **not** go through WhatsApp, since that channel is the one that's broken when they matter.
+
 **Noise suppression:** Baileys logs harmless libsignal decryption errors (`Bad MAC`, `Failed to decrypt`) from other devices' sessions to `console.error` — these are intercepted and silenced.
 
 ## Environment Variables
@@ -52,6 +58,8 @@ All logic lives in `src/index.ts`. There are no other source files.
 |---|---|---|
 | `QUERY_SERVICE_URL` | `http://localhost:3000` | Base URL of the Query-Service |
 | `GROUP_JID` | *(optional)* | Restrict bot to one group (`120363…@g.us`). If unset, responds in all groups. |
+| `NOTIFY_URL` | *(optional)* | Push endpoint for auth alerts, ntfy.sh format (`https://ntfy.sh/<topic>`). If unset, alerts only go to stdout. |
+| `HEARTBEAT_URL` | *(optional)* | Dead-man's-switch ping URL (healthchecks.io, Uptime Kuma push). Pinged every 5 min while connected. |
 
 `.env` is gitignored. Copy `.env.example` to `.env`.
 
