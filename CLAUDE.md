@@ -44,6 +44,8 @@ All logic lives in `src/index.ts`. There are no other source files.
 8. `formatSources()` renders source URLs as `🔗 <url>` lines appended to the reply.
 9. Both replies are sent quoted to the original message.
 
+**Spieltag-Umfrage:** Every Sunday from `POLL_HOUR` (default 18:00, `POLL_TIMEZONE`) the bot posts a multi-select WhatsApp poll to `GROUP_JID` for the week starting 8 days later (Mo–Do with dates + "Kann nicht"). A minute timer (`checkPollSchedule()`) and every `connection === 'open'` check whether it is due, so a bot that reconnects later on Sunday evening still sends it. The `POLL_MARKER` file (`auth/.poll-sent`, holds e.g. `2026-W41`) prevents a second poll after a restart. If the whole Sunday was missed (e.g. auth lost), someone sends `!umfrage` (same target week as the Sunday run) or `!umfrage 41` / `!umfrage KW 41` for a specific ISO week. A week number lower than the current one is taken to mean next year. The poll goes to the chat the command came from, so a private chat with the bot works for testing without spamming the group. Only polls sent to `GROUP_JID` update the marker. Results are not read back, and people evaluate the poll themselves in WhatsApp. Local time comes from `Intl` with an explicit time zone, so the container needs no `TZ`/tzdata.
+
 **Reconnection:** `connection.update` handler calls `startBot()` recursively on disconnect unless the disconnect reason is `loggedOut` — in that case `park()` keeps the process alive instead. Without it Node would exit 0 (nothing left in the event loop), Docker's `restart: unless-stopped` would restart the container, and it would hit the same 401 within seconds — a restart loop that also re-fires the alert on every pass. Recovery from `park()` is manual: clear `auth/`, restart, rescan the QR code.
 
 **Auth monitoring:** Losing the WhatsApp session is silent by default — the process keeps running, so Docker's `restart: unless-stopped` never fires. Two independent layers cover this:
@@ -62,6 +64,8 @@ Notifications deliberately do **not** go through WhatsApp, since that channel is
 | `GROUP_JID` | *(optional)* | Restrict bot to one group (`120363…@g.us`). If unset, responds in all groups. |
 | `NOTIFY_URL` | *(optional)* | Push endpoint for auth alerts, ntfy.sh format (`https://ntfy.sh/<topic>`). If unset, alerts only go to stdout. |
 | `HEARTBEAT_URL` | *(optional)* | Dead-man's-switch ping URL (healthchecks.io, Uptime Kuma push). Pinged every 5 min while connected. |
+| `POLL_HOUR` | `18` | Hour (local time) on Sunday from which the weekly poll is sent. Requires `GROUP_JID`. |
+| `POLL_TIMEZONE` | `Europe/Berlin` | Time zone for the poll schedule and the dates in the poll. |
 
 `.env` is gitignored. Copy `.env.example` to `.env`.
 

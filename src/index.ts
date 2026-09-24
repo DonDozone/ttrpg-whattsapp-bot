@@ -8,7 +8,7 @@ import { Boom } from '@hapi/boom'
 import pino from 'pino'
 import qrcode from 'qrcode-terminal'
 import dotenv from 'dotenv'
-import { existsSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
 
 dotenv.config()
 
@@ -16,13 +16,22 @@ const QUERY_SERVICE_URL = process.env.QUERY_SERVICE_URL ?? 'http://localhost:300
 const GROUP_JID = process.env.GROUP_JID
 const NOTIFY_URL = process.env.NOTIFY_URL
 const HEARTBEAT_URL = process.env.HEARTBEAT_URL
+const POLL_TIMEZONE = process.env.POLL_TIMEZONE ?? 'Europe/Berlin'
+const POLL_HOUR = Number(process.env.POLL_HOUR ?? 18)
 
 const TRIGGER = '!wiki '
+// `!umfrage`, `!umfrage 41`, `!umfrage KW 41`, `!umfrage kw41`
+const POLL_COMMAND = /^!umfrage(?:\s+(?:kw\s*)?(\d{1,2}))?\s*$/i
+const POLL_CHECK_INTERVAL_MS = 60_000
+const DAY_MS = 24 * 60 * 60_000
 const ALERT_COOLDOWN_MS = 15 * 60_000
 const HEARTBEAT_INTERVAL_MS = 5 * 60_000
 
 // Liegt im auth-Volume und überlebt damit Container-Neustarts.
 const ALERT_MARKER = 'auth/.alert-sent'
+// Merkt sich die zuletzt in GROUP_JID gepostete Umfrage-KW (z.B. `2026-W41`),
+// damit ein Neustart am Sonntagabend keine zweite Umfrage auslöst.
+const POLL_MARKER = 'auth/.poll-sent'
 
 // Disconnect-Codes, bei denen die Session tot ist und ein neuer QR-Scan ansteht.
 const FATAL_DISCONNECTS: Record<number, string> = {
@@ -186,12 +195,164 @@ async function fetchChat(question: string): Promise<string> {
   return sourcesBlock ? `${text}\n\n${sourcesBlock}` : text
 }
 
+// --- Spieltag-Umfrage ------------------------------------------------------
+//
+// Datumsrechnung läuft komplett auf UTC-Mitternacht-Daten, die nur als
+// Kalendertag dienen. Die lokale Zeit (Wochentag, Stunde) kommt über Intl, so
+// hängt nichts an der Zeitzone des Containers (node:alpine hat kein tzdata).
+
+interface IsoWeek {
+  year: number
+  week: number
+}
+
+const WEEKDAY_INDEX: Record<string, number> = {
+  Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7,
+}
+
+const POLL_DAYS = ['Mo', 'Di', 'Mi', 'Do']
+
+function localNow(): { date: Date; weekday: number; hour: number } {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: POLL_TIMEZONE,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      weekday: 'short',
+      hour: '2-digit',
+      hourCycle: 'h23',
+    })
+      .formatToParts(new Date())
+      .map(p => [p.type, p.value]),
+  )
+  return {
+    date: new Date(Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day))),
+    weekday: WEEKDAY_INDEX[parts.weekday],
+    hour: Number(parts.hour),
+  }
+}
+
+function isoWeekOf(date: Date): IsoWeek {
+  // Der Donnerstag einer Woche liegt immer im ISO-Jahr dieser Woche.
+  const thursday = new Date(date.getTime() + (4 - (date.getUTCDay() || 7)) * DAY_MS)
+  const year = thursday.getUTCFullYear()
+  const week = Math.floor((thursday.getTime() - Date.UTC(year, 0, 1)) / DAY_MS / 7) + 1
+  return { year, week }
+}
+
+function mondayOf({ year, week }: IsoWeek): Date {
+  // Der 4. Januar liegt immer in KW 1.
+  const jan4 = new Date(Date.UTC(year, 0, 4))
+  const mondayWeek1 = jan4.getTime() - ((jan4.getUTCDay() || 7) - 1) * DAY_MS
+  return new Date(mondayWeek1 + (week - 1) * 7 * DAY_MS)
+}
+
+function weeksInYear(year: number): number {
+  return isoWeekOf(new Date(Date.UTC(year, 11, 28))).week
+}
+
+function weekKey({ year, week }: IsoWeek): string {
+  return `${year}-W${String(week).padStart(2, '0')}`
+}
+
+function formatDay(date: Date): string {
+  const d = String(date.getUTCDate()).padStart(2, '0')
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0')
+  return `${d}.${m}.`
+}
+
+// Standard-Ziel: die Woche, die in 8 Tagen beginnt — am Sonntag also die
+// übernächste Woche. Ein nachgeholter Aufruf unter der Woche trifft dieselbe KW.
+function defaultPollWeek(): IsoWeek {
+  return isoWeekOf(new Date(localNow().date.getTime() + 8 * DAY_MS))
+}
+
+// Eine KW ohne Jahr meint die nächste Woche mit dieser Nummer: liegt sie in
+// diesem Jahr schon zurück, ist das nächste Jahr gemeint.
+function resolvePollWeek(week: number): IsoWeek | null {
+  const current = isoWeekOf(localNow().date)
+  const year = week >= current.week ? current.year : current.year + 1
+  if (week < 1 || week > weeksInYear(year)) return null
+  return { year, week }
+}
+
+function buildPoll(target: IsoWeek) {
+  const monday = mondayOf(target)
+  const days = POLL_DAYS.map((name, i) => `${name}, ${formatDay(new Date(monday.getTime() + i * DAY_MS))}`)
+  const thursday = new Date(monday.getTime() + 3 * DAY_MS)
+  return {
+    name:
+      `📜 Der Archivar ruft die Runde zusammen: An welchen Tagen der ` +
+      `KW ${target.week} (${formatDay(monday)}–${formatDay(thursday)}) könnt Ihr erscheinen?`,
+    values: [...days, 'Kann nicht'],
+    selectableCount: 0, // 0 = Mehrfachauswahl ohne Begrenzung
+  }
+}
+
+function readPollMarker(): string | null {
+  try {
+    return existsSync(POLL_MARKER) ? readFileSync(POLL_MARKER, 'utf8').trim() : null
+  } catch (err) {
+    _origError('Umfrage-Marker nicht lesbar:', err)
+    return null
+  }
+}
+
+let currentSock: ReturnType<typeof makeWASocket> | null = null
+let isConnected = false
+let pollInFlight = false
+
+async function sendPoll(jid: string, target: IsoWeek): Promise<void> {
+  if (!currentSock) throw new Error('Kein Socket')
+  await currentSock.sendMessage(jid, { poll: buildPoll(target) })
+  console.log(`🗳️ Umfrage für ${weekKey(target)} gesendet an ${jid}`)
+  if (jid !== GROUP_JID) return
+  try {
+    writeFileSync(POLL_MARKER, `${weekKey(target)}\n`)
+  } catch (err) {
+    _origError('Umfrage-Marker nicht schreibbar:', err)
+  }
+}
+
+let warnedNoGroup = false
+
+// Läuft minütlich und direkt nach jedem Verbindungsaufbau. Das Fenster ist der
+// ganze Sonntag ab POLL_HOUR: kommt der Bot erst später am Abend wieder online,
+// wird die Umfrage nachgeholt. Danach bleibt nur der manuelle `!umfrage`.
+async function checkPollSchedule(): Promise<void> {
+  if (!isConnected || pollInFlight) return
+  const now = localNow()
+  if (now.weekday !== 7 || now.hour < POLL_HOUR) return
+  if (!GROUP_JID) {
+    if (!warnedNoGroup) console.log('⚠️ GROUP_JID fehlt — automatische Umfrage übersprungen')
+    warnedNoGroup = true
+    return
+  }
+
+  const target = defaultPollWeek()
+  if (readPollMarker() === weekKey(target)) return
+
+  pollInFlight = true
+  try {
+    await sendPoll(GROUP_JID, target)
+  } catch (err) {
+    // Kein Marker geschrieben, also nächster Versuch in einer Minute.
+    _origError('Automatische Umfrage fehlgeschlagen:', err)
+  } finally {
+    pollInFlight = false
+  }
+}
+
+setInterval(() => void checkPollSchedule(), POLL_CHECK_INTERVAL_MS)
+
 async function startBot(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState('auth')
   const wasRegistered = state.creds.registered
   const { version } = await fetchLatestBaileysVersion()
 
   const sock = makeWASocket({ version, auth: state, logger })
+  currentSock = sock
 
   sock.ev.on('creds.update', saveCreds)
 
@@ -210,6 +371,7 @@ async function startBot(): Promise<void> {
       }
     }
     if (connection === 'close') {
+      isConnected = false
       stopHeartbeat()
       const code = (lastDisconnect?.error as Boom)?.output?.statusCode
       const shouldReconnect = code !== DisconnectReason.loggedOut
@@ -230,6 +392,8 @@ async function startBot(): Promise<void> {
       console.log('✅ WhatsApp-Bot verbunden')
       clearAlertMarker()
       startHeartbeat()
+      isConnected = true
+      void checkPollSchedule()
     }
   })
 
@@ -249,6 +413,33 @@ async function startBot(): Promise<void> {
 
       const text = getMessageText(msg)
       if (!text) continue
+
+      // Die Umfrage landet im Chat, aus dem der Befehl kommt — im Privatchat
+      // mit dem Bot lässt sich also testen, ohne die Gruppe zu stören.
+      const pollMatch = text.trim().match(POLL_COMMAND)
+      if (pollMatch) {
+        const target = pollMatch[1] ? resolvePollWeek(Number(pollMatch[1])) : defaultPollWeek()
+        if (!target) {
+          await sock.sendMessage(
+            jid,
+            { text: `⚠️ Eine KW ${pollMatch[1]} kennt der Archivar nicht.` },
+            { quoted: msg },
+          )
+          continue
+        }
+        console.log(`🗳️ [${jid}] Umfrage angefordert für ${weekKey(target)}`)
+        try {
+          await sendPoll(jid, target)
+        } catch (err) {
+          console.error('Umfrage fehlgeschlagen:', err)
+          await sock.sendMessage(
+            jid,
+            { text: '⚠️ Die Umfrage konnte nicht erstellt werden.' },
+            { quoted: msg },
+          )
+        }
+        continue
+      }
 
       const mentionedJids =
         msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ?? []
