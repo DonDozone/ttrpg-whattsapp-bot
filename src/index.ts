@@ -17,11 +17,16 @@ const GROUP_JID = process.env.GROUP_JID
 const NOTIFY_URL = process.env.NOTIFY_URL
 const HEARTBEAT_URL = process.env.HEARTBEAT_URL
 const POLL_TIMEZONE = process.env.POLL_TIMEZONE ?? 'Europe/Berlin'
-const POLL_HOUR = Number(process.env.POLL_HOUR ?? 18)
+const POLL_HOUR = Number(process.env.POLL_HOUR ?? 12)
+// Telefonnummer (nur Ziffern), die sonntags gefragt wird und die Umfrage per
+// `ja` freigibt. Ohne sie geht die Umfrage wie früher automatisch raus.
+const POLL_ADMIN = process.env.POLL_ADMIN?.replace(/\D/g, '') || undefined
 
 const TRIGGER = '!wiki '
 // `!umfrage`, `!umfrage 41`, `!umfrage KW 41`, `!umfrage kw41`
 const POLL_COMMAND = /^!umfrage(?:\s+(?:kw\s*)?(\d{1,2}))?\s*$/i
+// Freigabe im Privatchat: `ja`, `ja 43`, `ja KW 43`, `Ja!`
+const POLL_APPROVAL = /^ja(?:\s+(?:kw\s*)?(\d{1,2}))?\s*[.!]?$/i
 const POLL_CHECK_INTERVAL_MS = 60_000
 const DAY_MS = 24 * 60 * 60_000
 const ALERT_COOLDOWN_MS = 15 * 60_000
@@ -32,6 +37,8 @@ const ALERT_MARKER = 'auth/.alert-sent'
 // Merkt sich die zuletzt in GROUP_JID gepostete Umfrage-KW (z.B. `2026-W41`),
 // damit ein Neustart am Sonntagabend keine zweite Umfrage auslöst.
 const POLL_MARKER = 'auth/.poll-sent'
+// Dasselbe für die Rückfrage an POLL_ADMIN: eine Frage pro KW.
+const POLL_ASK_MARKER = 'auth/.poll-asked'
 
 // Disconnect-Codes, bei denen die Session tot ist und ein neuer QR-Scan ansteht.
 const FATAL_DISCONNECTS: Record<number, string> = {
@@ -290,13 +297,43 @@ function buildPoll(target: IsoWeek) {
   }
 }
 
-function readPollMarker(): string | null {
+function readMarker(path: string): string | null {
   try {
-    return existsSync(POLL_MARKER) ? readFileSync(POLL_MARKER, 'utf8').trim() : null
+    return existsSync(path) ? readFileSync(path, 'utf8').trim() : null
   } catch (err) {
-    _origError('Umfrage-Marker nicht lesbar:', err)
+    _origError(`Marker ${path} nicht lesbar:`, err)
     return null
   }
+}
+
+function writeMarker(path: string, target: IsoWeek): void {
+  try {
+    writeFileSync(path, `${weekKey(target)}\n`)
+  } catch (err) {
+    _origError(`Marker ${path} nicht schreibbar:`, err)
+  }
+}
+
+function buildPollQuestion(target: IsoWeek): string {
+  const monday = mondayOf(target)
+  const thursday = new Date(monday.getTime() + 3 * DAY_MS)
+  const next = target.week === weeksInYear(target.year) ? 1 : target.week + 1
+  return (
+    `📜 Soll der Archivar die Umfrage für *KW ${target.week}* ` +
+    `(Mo ${formatDay(monday)} – Do ${formatDay(thursday)}) in die Gruppe stellen?\n\n` +
+    `*ja* → Umfrage für KW ${target.week}\n` +
+    `*ja ${next}* → eine andere Woche\n` +
+    `Ohne Antwort gibt es keine Umfrage.`
+  )
+}
+
+// Privatchats kommen je nach WhatsApp-Version unter der Telefonnummer oder
+// einer LID an; im LID-Fall steht die Nummer in `senderPn`.
+function isPollAdmin(msg: WAMessage): boolean {
+  if (!POLL_ADMIN) return false
+  return [msg.key.remoteJid, msg.key.senderPn].some(
+    j => (j ?? '').split(':')[0].split('@')[0] === POLL_ADMIN,
+  )
 }
 
 let currentSock: ReturnType<typeof makeWASocket> | null = null
@@ -307,19 +344,16 @@ async function sendPoll(jid: string, target: IsoWeek): Promise<void> {
   if (!currentSock) throw new Error('Kein Socket')
   await currentSock.sendMessage(jid, { poll: buildPoll(target) })
   console.log(`🗳️ Umfrage für ${weekKey(target)} gesendet an ${jid}`)
-  if (jid !== GROUP_JID) return
-  try {
-    writeFileSync(POLL_MARKER, `${weekKey(target)}\n`)
-  } catch (err) {
-    _origError('Umfrage-Marker nicht schreibbar:', err)
-  }
+  if (jid === GROUP_JID) writeMarker(POLL_MARKER, target)
 }
 
 let warnedNoGroup = false
 
 // Läuft minütlich und direkt nach jedem Verbindungsaufbau. Das Fenster ist der
-// ganze Sonntag ab POLL_HOUR: kommt der Bot erst später am Abend wieder online,
-// wird die Umfrage nachgeholt. Danach bleibt nur der manuelle `!umfrage`.
+// ganze Sonntag ab POLL_HOUR: kommt der Bot erst später am Tag wieder online,
+// wird nachgeholt. Danach bleibt nur der manuelle `!umfrage`.
+// Mit POLL_ADMIN geht sonntags nur eine Rückfrage an diese Nummer raus; die
+// Umfrage selbst kommt erst mit dem `ja` (siehe messages.upsert).
 async function checkPollSchedule(): Promise<void> {
   if (!isConnected || pollInFlight) return
   const now = localNow()
@@ -331,11 +365,24 @@ async function checkPollSchedule(): Promise<void> {
   }
 
   const target = defaultPollWeek()
-  if (readPollMarker() === weekKey(target)) return
+  const key = weekKey(target)
+  // Steht die Umfrage schon in der Gruppe (z.B. per `!umfrage`), erübrigt sich
+  // auch die Rückfrage.
+  if (readMarker(POLL_MARKER) === key) return
+  if (POLL_ADMIN && readMarker(POLL_ASK_MARKER) === key) return
 
   pollInFlight = true
   try {
-    await sendPoll(GROUP_JID, target)
+    if (POLL_ADMIN) {
+      if (!currentSock) throw new Error('Kein Socket')
+      await currentSock.sendMessage(`${POLL_ADMIN}@s.whatsapp.net`, {
+        text: buildPollQuestion(target),
+      })
+      console.log(`❔ Rückfrage für ${key} an ${POLL_ADMIN} gesendet`)
+      writeMarker(POLL_ASK_MARKER, target)
+    } else {
+      await sendPoll(GROUP_JID, target)
+    }
   } catch (err) {
     // Kein Marker geschrieben, also nächster Versuch in einer Minute.
     _origError('Automatische Umfrage fehlgeschlagen:', err)
@@ -413,6 +460,38 @@ async function startBot(): Promise<void> {
 
       const text = getMessageText(msg)
       if (!text) continue
+
+      // `ja` von POLL_ADMIN im Privatchat gibt die Umfrage für die Gruppe frei.
+      // Ohne KW gilt dieselbe Rechnung wie für die Rückfrage: von Sonntag bis
+      // Samstag trifft `ja` deren KW, der Bot muss sich also nichts merken.
+      const approvalMatch = isGroup ? null : text.trim().match(POLL_APPROVAL)
+      if (approvalMatch && isPollAdmin(msg)) {
+        const target = approvalMatch[1]
+          ? resolvePollWeek(Number(approvalMatch[1]))
+          : defaultPollWeek()
+        let reply: string
+        if (!target) {
+          reply = `⚠️ Eine KW ${approvalMatch[1]} kennt der Archivar nicht.`
+        } else if (!GROUP_JID) {
+          reply = '⚠️ GROUP_JID fehlt — der Archivar weiß nicht, wohin mit der Umfrage.'
+        } else if (readMarker(POLL_MARKER) === weekKey(target)) {
+          reply = `☑️ Die Umfrage für KW ${target.week} steht schon in der Gruppe.`
+        } else {
+          console.log(`🗳️ [${jid}] Umfrage freigegeben für ${weekKey(target)}`)
+          try {
+            await sendPoll(GROUP_JID, target)
+            reply = `✅ Die Umfrage für KW ${target.week} steht in der Gruppe.`
+          } catch (err) {
+            console.error('Umfrage fehlgeschlagen:', err)
+            reply = '⚠️ Die Umfrage konnte nicht erstellt werden.'
+          }
+        }
+        await sock.sendMessage(jid, { text: reply }, { quoted: msg })
+        continue
+      }
+      // Hilft, falls WhatsApp den Privatchat unter einer LID ohne `senderPn`
+      // zustellt und die Freigabe deshalb ins Leere läuft.
+      if (approvalMatch && POLL_ADMIN) console.log(`⏭️ [${jid}] "ja" ignoriert — nicht POLL_ADMIN`)
 
       // Die Umfrage landet im Chat, aus dem der Befehl kommt — im Privatchat
       // mit dem Bot lässt sich also testen, ohne die Gruppe zu stören.
