@@ -21,12 +21,33 @@ const POLL_HOUR = Number(process.env.POLL_HOUR ?? 12)
 // Telefonnummer (nur Ziffern), die sonntags gefragt wird und die Umfrage per
 // `ja` freigibt. Ohne sie geht die Umfrage wie früher automatisch raus.
 const POLL_ADMIN = process.env.POLL_ADMIN?.replace(/\D/g, '') || undefined
+// Foundry-Schalter auf demselben Host (network_mode: host). Ohne Token ist
+// `!foundry` deaktiviert.
+const SWITCH_URL = (process.env.SWITCH_URL ?? 'http://127.0.0.1:8090').replace(/\/+$/, '')
+const SWITCH_TOKEN = process.env.SWITCH_TOKEN || undefined
+// Telefonnummern (nur Ziffern), die `!foundry` benutzen dürfen.
+const FOUNDRY_ADMINS = new Set(
+  (process.env.FOUNDRY_ADMINS ?? '')
+    .split(',')
+    .map(n => n.replace(/\D/g, ''))
+    .filter(Boolean),
+)
 
 const TRIGGER = '!wiki '
 // `!umfrage`, `!umfrage 41`, `!umfrage KW 41`, `!umfrage kw41`
 const POLL_COMMAND = /^!umfrage(?:\s+(?:kw\s*)?(\d{1,2}))?\s*$/i
 // Freigabe im Privatchat: `ja`, `ja 43`, `ja KW 43`, `Ja!`
 const POLL_APPROVAL = /^ja(?:\s+(?:kw\s*)?(\d{1,2}))?\s*[.!]?$/i
+// `!foundry`, `!foundry status`, `!foundry asche`, `!foundry v14`
+const FOUNDRY_COMMAND = /^!foundry(?:\s+(.*))?$/i
+// Bestätigung einer offenen Foundry-Rückfrage: nur ein schlichtes `ja`.
+const FOUNDRY_CONFIRM = /^ja\s*[.!]?$/i
+const FOUNDRY_CONFIRM_MS = 2 * 60_000
+// So lange nach Ablauf wird ein verspätetes `ja` noch als Antwort auf die
+// Foundry-Rückfrage gewertet (und abgelehnt), statt z.B. die Umfrage freizugeben.
+const FOUNDRY_LATE_MS = 15 * 60_000
+// Ein Umschalten dauert wenige Sekunden; das ist nur die Notbremse.
+const SWITCH_TIMEOUT_MS = 200_000
 const POLL_CHECK_INTERVAL_MS = 60_000
 const DAY_MS = 24 * 60 * 60_000
 const ALERT_COOLDOWN_MS = 15 * 60_000
@@ -393,6 +414,166 @@ async function checkPollSchedule(): Promise<void> {
 
 setInterval(() => void checkPollSchedule(), POLL_CHECK_INTERVAL_MS)
 
+// --- Foundry-Schalter --------------------------------------------------------
+//
+// Von den beiden Foundry-Containern darf aus Lizenzgründen immer nur einer
+// laufen. Umgeschaltet wird über den Schalter-Dienst auf dem Host; der Bot
+// fragt nur ab und löst aus.
+
+type FoundryInstance = 'asche' | 'v14'
+
+const FOUNDRY_INSTANCES: Record<FoundryInstance, { name: string; detail: string; url: string }> = {
+  asche: { name: 'Zeit der Asche', detail: 'V13', url: 'https://spiel.pnp-utils.de' },
+  v14: { name: 'V14', detail: 'Hellbreaker und Call of Cthulhu', url: 'https://foundry.pnp-utils.de' },
+}
+
+interface ContainerState {
+  status: string
+  health: string
+}
+
+interface SwitchStatus {
+  aktiv: FoundryInstance | null
+  asche?: ContainerState
+  v14?: ContainerState
+}
+
+class SwitchError extends Error {
+  constructor(
+    readonly status: number,
+    readonly detail: string,
+  ) {
+    super(`Schalter antwortet mit HTTP ${status}${detail ? `: ${detail}` : ''}`)
+  }
+}
+
+async function callSwitch(method: 'GET' | 'POST', path: string): Promise<SwitchStatus> {
+  const res = await fetch(`${SWITCH_URL}${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${SWITCH_TOKEN}`, 'X-Switch-Source': 'bot' },
+    signal: AbortSignal.timeout(SWITCH_TIMEOUT_MS),
+  })
+  const data = (await res.json().catch(() => ({}))) as Partial<SwitchStatus> & { fehler?: string }
+  if (!res.ok) throw new SwitchError(res.status, data.fehler ?? '')
+  return data as SwitchStatus
+}
+
+function describeInstance(instance: FoundryInstance): string {
+  const { name, detail } = FOUNDRY_INSTANCES[instance]
+  return `*${name}* (${detail})`
+}
+
+function formatSwitchStatus(status: SwitchStatus): string {
+  if (!status.aktiv) {
+    return '💤 Gerade läuft keine Foundry-Instanz. Starten mit `!foundry asche` oder `!foundry v14`.'
+  }
+  const { url } = FOUNDRY_INSTANCES[status.aktiv]
+  const state = status[status.aktiv]
+  if (state?.health === 'healthy') {
+    return `🟢 ${describeInstance(status.aktiv)} läuft und ist bereit: ${url}`
+  }
+  return `🟡 ${describeInstance(status.aktiv)} läuft, startet aber noch. Gleich unter ${url} erreichbar.`
+}
+
+function formatSwitchError(err: unknown): string {
+  if (err instanceof SwitchError) {
+    const detail = err.detail ? ` (${err.detail})` : ''
+    switch (err.status) {
+      case 401:
+        return '⚠️ Der Schalter lehnt das Token ab — SWITCH_TOKEN in der .env prüfen.'
+      case 409:
+        return `⏳ Gerade läuft schon ein anderer Umschaltvorgang. Bitte gleich nochmal versuchen.${detail}`
+      case 504:
+        return `⚠️ Der Schalter meldet eine Zeitüberschreitung${detail}. Stand mit \`!foundry status\` prüfen.`
+      default:
+        return `⚠️ Der Schalter meldet einen Fehler (HTTP ${err.status}${err.detail ? `: ${err.detail}` : ''}).`
+    }
+  }
+  if (err instanceof Error && err.name === 'TimeoutError') {
+    return '⚠️ Der Schalter hat nicht rechtzeitig geantwortet. Stand mit `!foundry status` prüfen.'
+  }
+  return '⚠️ Schalter nicht erreichbar.'
+}
+
+// In Gruppen steht der Absender in `participant`, im Privatchat in `remoteJid`;
+// kommt dort eine LID an, liefert `participantPn` bzw. `senderPn` die Nummer.
+// Gibt die passende Admin-Nummer zurück, damit Rückfrage und `ja` auch dann
+// zusammenfinden, wenn eine der beiden Nachrichten unter der LID ankommt.
+function foundryAdminOf(msg: WAMessage): string | null {
+  const ids = msg.key.remoteJid?.endsWith('@g.us')
+    ? [msg.key.participant, msg.key.participantPn]
+    : [msg.key.remoteJid, msg.key.senderPn]
+  for (const j of ids) {
+    const num = (j ?? '').split(':')[0].split('@')[0]
+    if (FOUNDRY_ADMINS.has(num)) return num
+  }
+  return null
+}
+
+interface FoundryPending {
+  target: FoundryInstance
+  expiresAt: number
+}
+
+// Offene Rückfragen, Schlüssel `<chat>|<admin-nummer>`: ein `ja` zählt nur vom
+// selben Absender im selben Chat. Hält nur im Speicher — nach einem Neustart
+// muss der Befehl ohnehin neu kommen.
+const foundryPending = new Map<string, FoundryPending>()
+
+// Entfernt die Rückfrage in jedem Fall; ein zweites `ja` schaltet nicht erneut.
+// Liegt der Ablauf länger als FOUNDRY_LATE_MS zurück, gilt sie als vergessen.
+function takeFoundryPending(key: string): FoundryPending | null {
+  const pending = foundryPending.get(key)
+  if (!pending) return null
+  foundryPending.delete(key)
+  return Date.now() > pending.expiresAt + FOUNDRY_LATE_MS ? null : pending
+}
+
+async function handleFoundryCommand(key: string, arg: string): Promise<string> {
+  const sub = arg.trim().toLowerCase() || 'status'
+  if (sub !== 'status' && sub !== 'asche' && sub !== 'v14') {
+    return 'Befehle: `!foundry status`, `!foundry asche`, `!foundry v14`'
+  }
+
+  let status: SwitchStatus
+  try {
+    status = await callSwitch('GET', '/status')
+  } catch (err) {
+    console.error('Foundry-Status fehlgeschlagen:', err)
+    return formatSwitchError(err)
+  }
+  if (sub === 'status') return formatSwitchStatus(status)
+
+  if (status.aktiv === sub) {
+    foundryPending.delete(key)
+    return `☑️ ${describeInstance(sub)} läuft schon: ${FOUNDRY_INSTANCES[sub].url}`
+  }
+  foundryPending.set(key, { target: sub, expiresAt: Date.now() + FOUNDRY_CONFIRM_MS })
+  const current = status.aktiv ? ` Gerade läuft ${describeInstance(status.aktiv)}.` : ''
+  return (
+    `⚠️ Auf ${describeInstance(sub)} umschalten?${current}\n` +
+    `Alle verbundenen Spieler fliegen raus. Mit *ja* bestätigen.`
+  )
+}
+
+async function switchFoundry(target: FoundryInstance): Promise<string> {
+  try {
+    const status = await callSwitch('POST', `/switch/${target}`)
+    console.log(`🎲 Foundry umgeschaltet auf ${target}`)
+    // Fehlt `aktiv` in der Antwort, gilt das HTTP-OK als Erfolg.
+    if (status.aktiv !== undefined && status.aktiv !== target) {
+      return `⚠️ Umgeschaltet, aber der Schalter meldet danach:\n${formatSwitchStatus(status)}`
+    }
+    return (
+      `✅ Jetzt läuft ${describeInstance(target)}. ` +
+      `In etwa 15 Sekunden erreichbar: ${FOUNDRY_INSTANCES[target].url}`
+    )
+  } catch (err) {
+    console.error('Foundry-Umschaltung fehlgeschlagen:', err)
+    return formatSwitchError(err)
+  }
+}
+
 async function startBot(): Promise<void> {
   const { state, saveCreds } = await useMultiFileAuthState('auth')
   const wasRegistered = state.creds.registered
@@ -460,6 +641,51 @@ async function startBot(): Promise<void> {
 
       const text = getMessageText(msg)
       if (!text) continue
+
+      // `ja` auf eine offene Foundry-Rückfrage geht der Umfragen-Freigabe vor.
+      // Ohne offene Rückfrage fällt es einfach durch.
+      const foundryAdmin = foundryAdminOf(msg)
+      const foundryKey = `${jid}|${foundryAdmin}`
+      const foundryConfirm =
+        foundryAdmin && FOUNDRY_CONFIRM.test(text.trim()) ? takeFoundryPending(foundryKey) : null
+      if (foundryConfirm) {
+        const { target } = foundryConfirm
+        if (Date.now() > foundryConfirm.expiresAt) {
+          await sock.sendMessage(
+            jid,
+            { text: `⌛ Die Rückfrage ist abgelaufen — bitte \`!foundry ${target}\` neu senden.` },
+            { quoted: msg },
+          )
+          continue
+        }
+        console.log(`🎲 [${jid}] Foundry-Umschaltung auf ${target} bestätigt`)
+        await sock.sendMessage(
+          jid,
+          { text: `⏳ Der Archivar schaltet auf ${describeInstance(target)} um …` },
+          { quoted: msg },
+        )
+        const reply = await switchFoundry(target)
+        await sock.sendMessage(jid, { text: reply }, { quoted: msg })
+        continue
+      }
+
+      // `!foundry` geht nie an den Query-Service.
+      const foundryMatch = text.trim().match(FOUNDRY_COMMAND)
+      if (foundryMatch) {
+        let reply: string
+        if (!SWITCH_TOKEN) {
+          console.log(`⚠️ [${jid}] !foundry ignoriert — SWITCH_TOKEN fehlt`)
+          reply = '⚠️ Der Foundry-Schalter ist nicht eingerichtet (SWITCH_TOKEN fehlt).'
+        } else if (!foundryAdmin) {
+          console.log(`⏭️ [${jid}] !foundry abgelehnt — nicht in FOUNDRY_ADMINS`)
+          reply = '⛔ Den Foundry-Schalter darf nur die Spielleitung bedienen.'
+        } else {
+          console.log(`🎲 [${jid}] ${text.trim()}`)
+          reply = await handleFoundryCommand(foundryKey, foundryMatch[1] ?? '')
+        }
+        await sock.sendMessage(jid, { text: reply }, { quoted: msg })
+        continue
+      }
 
       // `ja` von POLL_ADMIN im Privatchat gibt die Umfrage für die Gruppe frei.
       // Ohne KW gilt dieselbe Rechnung wie für die Rückfrage: von Sonntag bis
